@@ -21,6 +21,7 @@ class KVzapConfig(PretrainedConfig):
 
 class KVzapModel(PreTrainedModel):
     config_class = KVzapConfig  # type: ignore[assignment]
+    _tied_weights_keys = {}
 
     def __init__(self, config):
         super().__init__(config)
@@ -40,6 +41,10 @@ class KVzapModel(PreTrainedModel):
                 for _ in range(config.n_modules)
             )
 
+    @property
+    def all_tied_weights_keys(self):
+        return self._tied_weights_keys
+
     def forward(self, x):
         return torch.stack([module(x[:, i, :]) for i, module in enumerate(self.layers)], dim=1)
 
@@ -52,9 +57,18 @@ class KVzapPress(ScorerPress):
     states to predict importance scores for every KV pair.
     KVzapPress is designed to be used in conjunction with the DMSPress
     model_type can be "linear" or "mlp".
+
+    Parameters
+    ----------
+    model_type : Literal["linear", "mlp"], default="mlp"
+        Type of KVzap model to use
+    n_sink : int, default=4
+        Number of initial tokens to always preserve (sink tokens).
+        Only used when wrapped in DMSPress (when cache_position is available).
     """
 
     model_type: Literal["linear", "mlp"] = "mlp"
+    n_sink: int = 4
     kvzap_model_name: Optional[str] = field(default=None, init=False)
 
     def post_init_from_model(self, model):
@@ -72,8 +86,19 @@ class KVzapPress(ScorerPress):
         attentions: torch.Tensor,
         kwargs: dict,
     ) -> torch.Tensor:
-        module = self.kvzap_model.layers[module.layer_idx]
-        module = module.to(hidden_states.device, dtype=hidden_states.dtype).eval()
+        kvzap_module = self.kvzap_model.layers[module.layer_idx]
+        kvzap_module = kvzap_module.to(hidden_states.device, dtype=hidden_states.dtype).eval()
         with torch.no_grad():
-            scores = module(hidden_states).transpose(1, 2)
+            scores = kvzap_module(hidden_states).transpose(1, 2)
+
+        # If called from DMSPress, protect sink tokens with score=inf
+        if "cache_position" in kwargs and kwargs["cache_position"] is not None:
+            q_len = keys.shape[2]
+            first_pos = kwargs["cache_position"][0].item()
+
+            # Sink tokens (absolute positions 0 to n_sink-1) get score inf (never evicted)
+            n_sinks_in_chunk = max(0, min(self.n_sink - first_pos, q_len))
+            if n_sinks_in_chunk > 0:
+                scores[:, :, :n_sinks_in_chunk] = float("inf")
+
         return scores

@@ -83,7 +83,10 @@ class DMSPress(BasePress):
 
         # Compute importance scores for the new tokens using the underlying scorer press
         keys, values = extract_keys_and_values(cache, layer_idx)
-        scores = self.press.score(module, hidden_states, keys[:, :, -q_len:], values[:, :, -q_len:], None, kwargs)
+        # Extract attention weights for the new tokens (if available)
+        # output[1] has shape (batch, num_heads, q_len, k_len) - we want attention to the last q_len keys
+        attentions = output[1][:, :, :, -q_len:] if output[1] is not None else None
+        scores = self.press.score(module, hidden_states, keys[:, :, -q_len:], values[:, :, -q_len:], attentions, kwargs)
 
         # Accumulate scores in the buffer: reset during prefill, append during decoding
         if prefilling:

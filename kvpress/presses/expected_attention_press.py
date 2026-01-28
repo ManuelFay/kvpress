@@ -133,7 +133,77 @@ class ExpectedAttentionPress(ScorerPress):
         kwargs,
     ) -> torch.Tensor:
 
-        # Remove sink tokens
+        q_len = keys.size(2)
+
+        # Check if we have cache_position info (when called from DMSPress)
+        if "cache_position" in kwargs and kwargs["cache_position"] is not None:
+            # DMSPress mode: use absolute positions to identify sink tokens
+            first_pos = kwargs["cache_position"][0].item()
+
+            # Compute how many sink tokens are in this chunk
+            n_sinks_in_chunk = max(0, min(self.n_sink - first_pos, q_len))
+
+            # If chunk is entirely sinks, return max scores (they should never be evicted)
+            if n_sinks_in_chunk >= q_len:
+                return torch.ones_like(keys[..., 0]) * float("inf")
+
+            # Remove sink tokens from keys/values for scoring
+            keys_to_score = keys[:, :, n_sinks_in_chunk:]
+            values_to_score = values[:, :, n_sinks_in_chunk:]
+
+            # Also adjust hidden states if sinks are in chunk
+            if n_sinks_in_chunk > 0:
+                hidden_states_for_stats = hidden_states[:, n_sinks_in_chunk:]
+            else:
+                hidden_states_for_stats = hidden_states
+
+            # Need enough tokens for statistics
+            if hidden_states_for_stats.shape[1] == 0:
+                return torch.ones_like(keys[..., 0]) * float("inf")
+
+            # Compute query statistics (but don't skip n_sink tokens since we already removed them)
+            q_len_for_rope = hidden_states.shape[1]
+            h = hidden_states_for_stats
+            query_states = get_prerope_query_states(module, h)
+
+            # Query mean
+            mu = query_states.mean(dim=2, keepdim=True)
+
+            # Query covariance
+            cov = None
+            if self.use_covariance:
+                centered_states = query_states - mu
+                cov = torch.einsum("bnsi,bnsj->bnij", centered_states, centered_states) / h.shape[1]
+            mu = mu.squeeze(2)
+
+            # Apply RoPE to the mean and covariance matrix of the queries
+            mu, cov = self.apply_avg_rope(module, mu, cov, q_len_for_rope)
+
+            # Compute scores for non-sink tokens
+            bsz, num_key_value_heads, k_len, d = keys_to_score.shape
+            num_key_value_groups = module.config.num_attention_heads // num_key_value_heads
+
+            keys_repeated = repeat_kv(keys_to_score, num_key_value_groups).transpose(2, 3)
+            scores = torch.matmul(mu.unsqueeze(2), keys_repeated).squeeze(2) / math.sqrt(d)
+            if self.use_covariance:
+                scores += torch.einsum("bhin, bhij, bhjn->bhn", keys_repeated, cov, keys_repeated) / d / 2
+            scores = F.softmax(scores, dim=-1)
+
+            # Average scores across groups
+            scores = scores.view(bsz, num_key_value_heads, num_key_value_groups, k_len)
+            scores = scores.mean(dim=2)
+
+            # Rescale scores by the norm of the values
+            if self.use_vnorm:
+                scores = (scores + self.epsilon) * values_to_score.norm(dim=-1)
+
+            # Add back the sink tokens with inf score (never evicted)
+            if n_sinks_in_chunk > 0:
+                scores = F.pad(scores, (n_sinks_in_chunk, 0), value=float("inf"))
+
+            return scores
+
+        # Standalone mode: original behavior
         assert keys.size(2) > self.n_sink, f"Input should contain more tokens than n_sink={self.n_sink}"
         keys = keys[:, :, self.n_sink :]
         values = values[:, :, self.n_sink :]

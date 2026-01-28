@@ -134,14 +134,37 @@ class BasePress:
         cache = kwargs["past_key_values"]
         cache_layer = cache.layers[module.layer_idx]
         q_len = hidden_states.shape[1]
+        cache_position = kwargs.get("cache_position", None)
 
-        # Don't compress after pre-filling
-        if kwargs["cache_position"][-1] > q_len:
+        # Only compress during prefilling (processing multiple tokens at once)
+        # Don't compress during autoregressive decoding (one token at a time)
+        if q_len == 1:
             return output
 
         keys, values = extract_keys_and_values(cache, module.layer_idx)
 
-        keys, values = self.compress(module, hidden_states, keys, values, output[1], kwargs)
+        # For chunked evaluation: only compress the NEW tokens, not the already-compressed ones
+        # This prevents exponential cache decay from repeated compression
+        if cache_position is not None and cache_position[0].item() > 0:
+            # Split cache into old (already compressed) and new (just added) tokens
+            split_pos = cache_position[0].item()
+            old_keys, new_keys = keys[:, :, :split_pos, :], keys[:, :, split_pos:, :]
+            old_values, new_values = values[:, :, :split_pos, :], values[:, :, split_pos:, :]
+
+            # Slice attention matrix to match new tokens (if attention is available)
+            # output[1] has shape (batch, num_heads, q_len, k_len)
+            # We only want attention weights for the new k positions
+            new_attentions = output[1][:, :, :, split_pos:] if output[1] is not None else None
+
+            # Only compress the new tokens
+            new_keys, new_values = self.compress(module, hidden_states, new_keys, new_values, new_attentions, kwargs)
+
+            # Concatenate old (already compressed) + newly compressed
+            keys = torch.cat([old_keys, new_keys], dim=2)
+            values = torch.cat([old_values, new_values], dim=2)
+        else:
+            # First chunk or non-chunked evaluation: compress all tokens
+            keys, values = self.compress(module, hidden_states, keys, values, output[1], kwargs)
 
         if isinstance(cache, QuantizedCache):
             cache_layer._quantized_keys = cache_layer._quantize(keys, axis=cache_layer.axis_key)
