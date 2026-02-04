@@ -222,3 +222,8 @@ class BasePress:
         finally:
             for forward_hook in hooks:
                 forward_hook.remove()
+            # Clean up masked_key_indices on all attention modules to prevent
+            # accumulation when running multiple methods sequentially
+            for layer in language_model.layers:
+                if hasattr(layer.self_attn, 'masked_key_indices'):
+                    layer.self_attn.masked_key_indices = None

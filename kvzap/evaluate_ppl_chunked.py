@@ -133,7 +133,9 @@ from kvpress import KVzapPress, DMSPress
 from kvpress.presses.kvzap_press import KVzapModel
 from kvpress.presses.scorer_press import ScorerPress
 import multiprocessing as mp
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
+
+from kvzap.loaders import Sample, create_loader
 
 # DMSPress sliding window size (protects most recent N tokens from eviction)
 DMS_SLIDING_WINDOW_SIZE = 128
@@ -192,7 +194,8 @@ def load_jsonl_dataset(file_path: str, max_samples: int = None) -> List:
 def calculate_perplexity_chunked(
     model,
     tokenizer,
-    texts: List[str],
+    texts: Optional[List[str]] = None,
+    samples: Optional[List[Sample]] = None,
     max_length: int = 8192,
     chunk_size: int = 1,
     press=None,
@@ -221,8 +224,11 @@ def calculate_perplexity_chunked(
         The language model to evaluate
     tokenizer : AutoTokenizer
         Tokenizer for the model
-    texts : list[str]
-        List of text strings to evaluate
+    texts : list[str], optional
+        List of text strings to evaluate (will be tokenized)
+    samples : list[Sample], optional
+        List of pre-tokenized Sample objects (with optional masks)
+        Either texts or samples must be provided, not both.
     max_length : int, default=8192
         Maximum sequence length (longer sequences are truncated)
     chunk_size : int, default=1
@@ -243,16 +249,35 @@ def calculate_perplexity_chunked(
         - perplexity: Perplexity score (exp(avg_nll))
         - avg_nll: Average negative log-likelihood per token
         - total_nll: Total negative log-likelihood
-        - total_tokens: Total number of tokens evaluated
-        - num_samples: Number of text samples processed
+        - total_tokens: Total number of tokens evaluated (unmasked only if using masks)
+        - total_masked_tokens: Total number of masked tokens (excluded from loss)
+        - num_samples: Number of samples processed
         - chunk_size: Chunk size used
         - nll_per_sample: List of per-sample NLL values
+        - loader_mode: "texts" or "samples" indicating input type
         - compression_stats: (if compression used) Detailed compression statistics
           including sparsity with/without sliding window
     """
+    # Validate inputs
+    if texts is None and samples is None:
+        raise ValueError("Either texts or samples must be provided")
+    if texts is not None and samples is not None:
+        raise ValueError("Provide either texts or samples, not both")
+
+    # Convert texts to samples if needed
+    loader_mode = "samples" if samples is not None else "texts"
+    if texts is not None:
+        samples = []
+        for text in texts:
+            tokens = tokenizer.encode(text)
+            if len(tokens) > max_length:
+                tokens = tokens[:max_length]
+            samples.append(Sample(tokens=tokens, mask=None, src=None))
+
     model.eval()
     total_nll = 0.0
     total_tokens = 0
+    total_masked_tokens = 0
     nlls_per_sample = []
     
     # CRITICAL: With chunk_size=1, compression is NEVER applied!
@@ -268,6 +293,17 @@ def calculate_perplexity_chunked(
             UserWarning
         )
 
+    # Detect if press needs attention outputs (H2O, ObservedAttention)
+    needs_attention_outputs = False
+    if press is not None:
+        from kvpress.presses.h2o_press import H2OPress
+        from kvpress.presses.observed_attention_press import ObservedAttentionPress
+        # Check if the inner press (press.press) is H2O or ObservedAttention
+        if hasattr(press, 'press'):
+            needs_attention_outputs = isinstance(press.press, (H2OPress, ObservedAttentionPress))
+        else:
+            needs_attention_outputs = isinstance(press, (H2OPress, ObservedAttentionPress))
+
     # Compression statistics tracking
     compression_ratios_all = []
     total_keys_original = 0
@@ -282,16 +318,26 @@ def calculate_perplexity_chunked(
     with torch.inference_mode():
         sample_count = 0
         desc = tqdm_desc if tqdm_desc else "Calculating chunked perplexity"
-        for text in tqdm(texts, desc=desc, disable=disable_tqdm):
-            encodings = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length)
-            input_ids = encodings.input_ids.to(device)
+        for sample in tqdm(samples, desc=desc, disable=disable_tqdm):
+            # Use pre-tokenized tokens from Sample
+            tokens = sample.tokens
+            if len(tokens) > max_length:
+                tokens = tokens[:max_length]
+            input_ids = torch.tensor([tokens], device=device)
             seq_len = input_ids.size(1)
+
+            # Prepare mask tensor if sample has a mask
+            mask_tensor = None
+            if sample.mask is not None:
+                mask = sample.mask[:len(tokens)]  # Truncate mask to match tokens
+                mask_tensor = torch.tensor(mask, dtype=torch.bool, device=device)
 
             if seq_len < 2:
                 continue
 
             sample_nll = 0.0
             sample_tokens = 0
+            sample_masked_tokens = 0
             cache = DynamicCache()
             num_chunks = (seq_len + chunk_size - 1) // chunk_size
 
@@ -301,8 +347,14 @@ def calculate_perplexity_chunked(
                 method_name = "Baseline" if press is None else type(press).__name__
                 print(f"\n=== Debug: First sample ({method_name}) ===")
                 print(f"Sequence length: {seq_len}, Num chunks: {num_chunks}, Chunk size: {chunk_size}")
+                if mask_tensor is not None:
+                    print(f"Mask: {mask_tensor.sum().item()} unmasked out of {len(mask_tensor)} tokens")
 
-            for chunk_idx in range(num_chunks):
+            # Helper function to process a single chunk
+            def process_chunk(chunk_idx):
+                nonlocal total_keys_original, total_keys_kept, total_keys_in_window
+                nonlocal total_keys_outside_window, total_keys_discarded_outside_window
+
                 start_pos = chunk_idx * chunk_size
                 end_pos = min((chunk_idx + 1) * chunk_size, seq_len)
                 chunk_ids = input_ids[:, start_pos:end_pos]
@@ -311,25 +363,41 @@ def calculate_perplexity_chunked(
                 position_ids = torch.arange(start_pos, end_pos, device=device).unsqueeze(0)
                 cache_position = torch.arange(start_pos, end_pos, device=device)
 
+                outputs = model(
+                    input_ids=chunk_ids,
+                    position_ids=position_ids,
+                    past_key_values=cache,
+                    cache_position=cache_position,
+                    use_cache=True,
+                    return_dict=True,
+                    output_attentions=needs_attention_outputs if press is not None else False,
+                )
+
+                # Debug: Print H2O score statistics for first sample, first few chunks
+                if press is not None and debug_first_sample and chunk_idx < 3 and hasattr(press, 'scores_buffer'):
+                    for layer_idx, scores in press.scores_buffer.items():
+                        if layer_idx == 0:  # Only print layer 0 to reduce noise
+                            finite_scores = scores[scores != float('inf')]
+                            if finite_scores.numel() > 0:
+                                print(f"  Chunk {chunk_idx}, Layer 0 scores: min={finite_scores.min().item():.6f}, "
+                                      f"max={finite_scores.max().item():.6f}, mean={finite_scores.mean().item():.6f}, "
+                                      f"threshold={press.threshold}")
+                            break
+
+                # Track compression statistics
                 if press is not None:
-                    with press(model):
-                        outputs = model(
-                            input_ids=chunk_ids,
-                            position_ids=position_ids,
-                            past_key_values=cache,
-                            cache_position=cache_position,
-                            use_cache=True,
-                            return_dict=True,
-                        )
+                    # DMSPress: has compression_ratios attribute that tracks actual compression per layer
+                    if chunk_idx > 0 and hasattr(press, 'compression_ratios') and len(press.compression_ratios) > 0:
+                        compression_ratios_all.append(press.compression_ratio)
 
-                        # Track compression statistics
-                        # DMSPress: has compression_ratios attribute that tracks actual compression per layer
-                        if chunk_idx > 0 and hasattr(press, 'compression_ratios') and len(press.compression_ratios) > 0:
-                            compression_ratios_all.append(press.compression_ratio)
-
+                        # Only track keys/window stats on the FINAL chunk to avoid double-counting
+                        if chunk_idx == num_chunks - 1:
                             num_layers = len(press.compression_ratios)
                             num_heads = model.config.num_key_value_heads
-                            keys_in_cache = start_pos * num_layers * num_heads
+
+                            # Total keys in cache at end of sequence
+                            final_seq_len = end_pos  # This is the total sequence length processed
+                            keys_in_cache = final_seq_len * num_layers * num_heads
                             total_keys_original += keys_in_cache
                             keys_kept = keys_in_cache * (1 - press.compression_ratio)
                             total_keys_kept += keys_kept
@@ -339,108 +407,180 @@ def calculate_perplexity_chunked(
                             if hasattr(press, 'press') and hasattr(press.press, 'n_sink'):
                                 n_sink = press.press.n_sink
 
-                            # Calculate protected regions (sinks + sliding window)
-                            sink_keys_per_layer = min(n_sink, start_pos) if n_sink > 0 else 0
-                            window_keys_per_layer = min(DMS_SLIDING_WINDOW_SIZE, start_pos)
+                            # Calculate protected and compressible regions for the FULL sequence
+                            sink_keys = min(n_sink, final_seq_len) * num_layers * num_heads if n_sink > 0 else 0
+                            window_keys = min(DMS_SLIDING_WINDOW_SIZE, final_seq_len) * num_layers * num_heads
 
-                            # IMPORTANT: Compressible region excludes BOTH sinks and window
-                            # Protected = sinks + window (but don't double-count if they overlap)
-                            if start_pos <= n_sink:
-                                # All positions are sinks, no window yet
-                                protected_keys_per_layer = start_pos
-                                compressible_keys_per_layer = 0
-                            elif start_pos <= n_sink + DMS_SLIDING_WINDOW_SIZE:
-                                # Have sinks, but window would overlap with sinks
-                                protected_keys_per_layer = start_pos
-                                compressible_keys_per_layer = 0
+                            # Compressible region excludes BOTH sinks and window
+                            if final_seq_len <= n_sink:
+                                # All positions are sinks
+                                protected_keys = final_seq_len * num_layers * num_heads
+                                compressible_keys = 0
+                            elif final_seq_len <= n_sink + DMS_SLIDING_WINDOW_SIZE:
+                                # Have sinks but not enough for separate window
+                                protected_keys = final_seq_len * num_layers * num_heads
+                                compressible_keys = 0
                             else:
                                 # Have sinks + gap + window
-                                protected_keys_per_layer = n_sink + window_keys_per_layer
-                                compressible_keys_per_layer = start_pos - protected_keys_per_layer
-
-                            window_keys = window_keys_per_layer * num_layers * num_heads
-                            compressible_keys = compressible_keys_per_layer * num_layers * num_heads
+                                protected_keys = sink_keys + window_keys
+                                compressible_keys = keys_in_cache - protected_keys
 
                             total_keys_in_window += window_keys
                             total_keys_outside_window += compressible_keys
 
-                            # Keys discarded in compressible region
-                            # Note: sinks are always kept, so we don't count them as discarded
-                            keys_discarded = keys_in_cache - keys_kept
-                            total_keys_discarded_outside_window += keys_discarded
+                            # All discarded keys come from compressible region (protected keys never evicted)
+                            keys_discarded_total = keys_in_cache - keys_kept
+                            # Clamp to compressible region (can't discard more than exists there)
+                            keys_discarded_compressible = min(keys_discarded_total, compressible_keys)
+                            total_keys_discarded_outside_window += keys_discarded_compressible
 
-                            for layer_idx, ratio in press.compression_ratios.items():
-                                if layer_idx not in layer_compression_ratios:
-                                    layer_compression_ratios[layer_idx] = []
-                                layer_compression_ratios[layer_idx].append(ratio)
+                        for layer_idx, ratio in press.compression_ratios.items():
+                            if layer_idx not in layer_compression_ratios:
+                                layer_compression_ratios[layer_idx] = []
+                            layer_compression_ratios[layer_idx].append(ratio)
 
-                        # ScorerPress: has fixed compression_ratio attribute
-                        # NOTE: With chunk_size=1, compression is NOT actually applied!
-                        # The forward_hook skips when q_len=1. Only track stats when chunk_size > 1.
-                        elif chunk_idx > 0 and isinstance(press, ScorerPress) and chunk_size > 1:
-                            # For ScorerPress, compression_ratio is fixed at initialization
-                            target_ratio = press.compression_ratio
-                            compression_ratios_all.append(target_ratio)
+                    # ScorerPress: has fixed compression_ratio attribute
+                    # NOTE: With chunk_size=1, compression is NOT actually applied!
+                    # The forward_hook skips when q_len=1. Only track stats when chunk_size > 1.
+                    elif chunk_idx > 0 and isinstance(press, ScorerPress) and chunk_size > 1:
+                        # For ScorerPress, compression_ratio is fixed at initialization
+                        target_ratio = press.compression_ratio
+                        compression_ratios_all.append(target_ratio)
 
-                            num_layers = model.config.num_hidden_layers
-                            num_heads = model.config.num_key_value_heads
-                            keys_in_cache = start_pos * num_layers * num_heads
-                            total_keys_original += keys_in_cache
-                            keys_kept = keys_in_cache * (1 - target_ratio)
-                            total_keys_kept += keys_kept
+                        num_layers = model.config.num_hidden_layers
+                        num_heads = model.config.num_key_value_heads
+                        keys_in_cache = start_pos * num_layers * num_heads
+                        total_keys_original += keys_in_cache
+                        keys_kept = keys_in_cache * (1 - target_ratio)
+                        total_keys_kept += keys_kept
 
-                            # ScorerPress doesn't use sliding window, so all keys can be compressed
-                            total_keys_outside_window += keys_in_cache
-                            total_keys_discarded_outside_window += keys_in_cache - keys_kept
-                else:
-                    outputs = model(
-                        input_ids=chunk_ids,
-                        position_ids=position_ids,
-                        past_key_values=cache,
-                        cache_position=cache_position,
-                        use_cache=True,
-                        return_dict=True,
-                    )
+                        # ScorerPress doesn't use sliding window, so all keys can be compressed
+                        total_keys_outside_window += keys_in_cache
+                        total_keys_discarded_outside_window += keys_in_cache - keys_kept
 
-                cache = outputs.past_key_values
-                logits = outputs.logits
+                return outputs, start_pos, end_pos, chunk_len
 
-                # Calculate loss for this chunk
-                if end_pos < seq_len:
-                    chunk_labels = input_ids[:, start_pos + 1:end_pos + 1]
-                    loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-                    per_token_loss = loss_fct(logits.view(-1, logits.size(-1)), chunk_labels.view(-1))
-                    chunk_nll = per_token_loss.sum().item()
-                    chunk_tokens = chunk_labels.numel()
-                else:
-                    if chunk_len > 1:
-                        chunk_labels = input_ids[:, start_pos + 1:end_pos]
+            # CRITICAL: Keep press context open across ALL chunks for a sample
+            # This ensures masked_key_indices persist between chunks
+            if press is not None:
+                with press(model):
+                    for chunk_idx in range(num_chunks):
+                        outputs, start_pos, end_pos, chunk_len = process_chunk(chunk_idx)
+
+                        cache = outputs.past_key_values
+                        logits = outputs.logits
+
+                        # Calculate loss for this chunk with mask support
+                        if end_pos < seq_len:
+                            chunk_labels = input_ids[:, start_pos + 1:end_pos + 1]
+                            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+                            per_token_loss = loss_fct(logits.view(-1, logits.size(-1)), chunk_labels.view(-1))
+
+                            if mask_tensor is not None:
+                                label_mask = mask_tensor[start_pos + 1:end_pos + 1]
+                                per_token_loss = per_token_loss * label_mask.float()
+                                chunk_tokens = label_mask.sum().item()
+                                chunk_masked = (~label_mask).sum().item()
+                            else:
+                                chunk_tokens = chunk_labels.numel()
+                                chunk_masked = 0
+
+                            chunk_nll = per_token_loss.sum().item()
+                        else:
+                            if chunk_len > 1:
+                                chunk_labels = input_ids[:, start_pos + 1:end_pos]
+                                loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+                                per_token_loss = loss_fct(
+                                    logits[:, :-1, :].contiguous().view(-1, logits.size(-1)),
+                                    chunk_labels.view(-1)
+                                )
+
+                                if mask_tensor is not None:
+                                    label_mask = mask_tensor[start_pos + 1:end_pos]
+                                    per_token_loss = per_token_loss * label_mask.float()
+                                    chunk_tokens = label_mask.sum().item()
+                                    chunk_masked = (~label_mask).sum().item()
+                                else:
+                                    chunk_tokens = chunk_labels.numel()
+                                    chunk_masked = 0
+
+                                chunk_nll = per_token_loss.sum().item()
+                            else:
+                                chunk_nll = 0.0
+                                chunk_tokens = 0
+                                chunk_masked = 0
+
+                        sample_nll += chunk_nll
+                        sample_tokens += chunk_tokens
+                        sample_masked_tokens += chunk_masked
+
+                        if debug_first_sample:
+                            cache_size = cache.layers[0].keys.shape[2] if hasattr(cache, 'layers') and len(cache.layers) > 0 and hasattr(cache.layers[0], 'keys') else 0
+                            print(f"  Chunk {chunk_idx}: NLL={chunk_nll:.4f}, tokens={chunk_tokens}, cache_size={cache_size}")
+            else:
+                # Baseline (no press) - process all chunks without compression
+                for chunk_idx in range(num_chunks):
+                    outputs, start_pos, end_pos, chunk_len = process_chunk(chunk_idx)
+
+                    cache = outputs.past_key_values
+                    logits = outputs.logits
+
+                    # Calculate loss for this chunk with mask support
+                    if end_pos < seq_len:
+                        chunk_labels = input_ids[:, start_pos + 1:end_pos + 1]
                         loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-                        per_token_loss = loss_fct(
-                            logits[:, :-1, :].contiguous().view(-1, logits.size(-1)),
-                            chunk_labels.view(-1)
-                        )
+                        per_token_loss = loss_fct(logits.view(-1, logits.size(-1)), chunk_labels.view(-1))
+
+                        if mask_tensor is not None:
+                            label_mask = mask_tensor[start_pos + 1:end_pos + 1]
+                            per_token_loss = per_token_loss * label_mask.float()
+                            chunk_tokens = label_mask.sum().item()
+                            chunk_masked = (~label_mask).sum().item()
+                        else:
+                            chunk_tokens = chunk_labels.numel()
+                            chunk_masked = 0
+
                         chunk_nll = per_token_loss.sum().item()
-                        chunk_tokens = chunk_labels.numel()
                     else:
-                        chunk_nll = 0.0
-                        chunk_tokens = 0
+                        if chunk_len > 1:
+                            chunk_labels = input_ids[:, start_pos + 1:end_pos]
+                            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+                            per_token_loss = loss_fct(
+                                logits[:, :-1, :].contiguous().view(-1, logits.size(-1)),
+                                chunk_labels.view(-1)
+                            )
 
-                sample_nll += chunk_nll
-                sample_tokens += chunk_tokens
+                            if mask_tensor is not None:
+                                label_mask = mask_tensor[start_pos + 1:end_pos]
+                                per_token_loss = per_token_loss * label_mask.float()
+                                chunk_tokens = label_mask.sum().item()
+                                chunk_masked = (~label_mask).sum().item()
+                            else:
+                                chunk_tokens = chunk_labels.numel()
+                                chunk_masked = 0
 
-                # Debug: print NLL for each chunk of first sample
-                if debug_first_sample:
-                    cache_size = cache.layers[0].keys.shape[2] if hasattr(cache, 'layers') and len(cache.layers) > 0 and hasattr(cache.layers[0], 'keys') else 0
-                    print(f"  Chunk {chunk_idx}: NLL={chunk_nll:.4f}, tokens={chunk_tokens}, cache_size={cache_size}")
+                            chunk_nll = per_token_loss.sum().item()
+                        else:
+                            chunk_nll = 0.0
+                            chunk_tokens = 0
+                            chunk_masked = 0
+
+                    sample_nll += chunk_nll
+                    sample_tokens += chunk_tokens
+                    sample_masked_tokens += chunk_masked
+
+                    if debug_first_sample:
+                        cache_size = cache.layers[0].keys.shape[2] if hasattr(cache, 'layers') and len(cache.layers) > 0 and hasattr(cache.layers[0], 'keys') else 0
+                        print(f"  Chunk {chunk_idx}: NLL={chunk_nll:.4f}, tokens={chunk_tokens}, cache_size={cache_size}")
 
             if sample_tokens > 0:
                 total_nll += sample_nll
                 total_tokens += sample_tokens
+                total_masked_tokens += sample_masked_tokens
                 nlls_per_sample.append(sample_nll / sample_tokens)
 
             if debug_first_sample:
-                print(f"Sample 0: Total NLL={sample_nll:.4f}, Total tokens={sample_tokens}, Avg NLL={sample_nll/sample_tokens if sample_tokens > 0 else 0:.4f}")
+                print(f"Sample 0: Total NLL={sample_nll:.4f}, Total tokens={sample_tokens}, Masked={sample_masked_tokens}, Avg NLL={sample_nll/sample_tokens if sample_tokens > 0 else 0:.4f}")
 
             sample_count += 1
             del cache
@@ -454,9 +594,11 @@ def calculate_perplexity_chunked(
         "avg_nll": avg_nll,
         "total_nll": total_nll,
         "total_tokens": total_tokens,
-        "num_samples": len(texts),
+        "total_masked_tokens": total_masked_tokens,
+        "num_samples": len(samples),
         "chunk_size": chunk_size,
         "nll_per_sample": nlls_per_sample,
+        "loader_mode": loader_mode,
     }
 
     if compression_ratios_all:
@@ -766,6 +908,7 @@ def evaluate_parallel(
 
 def run_single_threshold(
     texts: List[str],
+    samples: List[Sample],
     model,
     tokenizer,
     model_name: str,
@@ -795,7 +938,7 @@ def run_single_threshold(
 
         press = DMSPress(kvzap_press, threshold=threshold, decoding=True)
         compressed_results = calculate_perplexity_chunked(
-            model=model, tokenizer=tokenizer, texts=texts,
+            model=model, tokenizer=tokenizer, samples=samples,
             max_length=max_length, chunk_size=chunk_size, press=press, device=device,
         )
 
@@ -848,7 +991,7 @@ def print_summary_table(baseline_results: Dict, threshold_results: List[Dict]):
 
 
 def evaluate_ppl_chunked(
-    data_path: str,
+    data_path: str = None,
     model_name: str = "meta-llama/Meta-Llama-3.1-8B-Instruct",
     max_length: int = 8192,
     max_samples: int = None,
@@ -860,6 +1003,21 @@ def evaluate_ppl_chunked(
     device: str = "cuda:0",
     output_dir: str = "./ppl_results_chunked",
     num_gpus: int = None,
+    # New loader selection args
+    data_loader: str = "jsonl_text",
+    text_field: str = None,
+    # AMAIA loader args
+    amaia_sources_config: str = None,
+    amaia_seq_len: int = None,
+    amaia_seed: int = 42,
+    amaia_shuffle_buffer_size: int = 1,
+    amaia_tokenizer_name: str = "instruct_tiktoken_v6",
+    amaia_tokenizer_path: str = None,
+    amaia_path: str = "/storage/home/manufay/amaia",
+    # Token file loader args
+    token_data_path: str = None,
+    token_format: str = "auto",
+    token_field_names: str = None,
 ):
     """
     Evaluate perplexity with proper chunked KV compression simulation.
@@ -974,22 +1132,92 @@ def evaluate_ppl_chunked(
         )
         model.eval()
 
-    # Load dataset
-    print(f"\nLoading dataset: {data_path}")
-    data = load_jsonl_dataset(data_path, max_samples=max_samples)
-    print(f"Loaded {len(data)} samples")
+    # Validate loader arguments
+    if data_loader == "jsonl_text" and data_path is None:
+        raise ValueError("--data_path is required for jsonl_text loader")
+    if data_loader == "amaia" and amaia_sources_config is None:
+        raise ValueError("--amaia_sources_config is required for amaia loader")
+    if data_loader == "tokens_file" and token_data_path is None and data_path is None:
+        raise ValueError("--token_data_path (or --data_path) is required for tokens_file loader")
 
-    # Extract texts
-    if isinstance(data[0], dict):
-        if "text" in data[0]:
-            texts = [item["text"] for item in data]
-        elif "content" in data[0]:
-            texts = [item["content"] for item in data]
-        else:
-            first_key = list(data[0].keys())[0]
-            texts = [item[first_key] for item in data]
+    # Parse token field names if provided
+    token_field = "tokens"
+    mask_field = "mask"
+    if token_field_names:
+        parts = token_field_names.split(",")
+        token_field = parts[0].strip()
+        if len(parts) > 1:
+            mask_field = parts[1].strip()
+
+    # Load dataset using the appropriate loader
+    print(f"\nLoading dataset using {data_loader} loader...")
+
+    if data_loader == "jsonl_text":
+        # For jsonl_text, we need the tokenizer to create the loader
+        if tokenizer is None:
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+        loader = create_loader(
+            loader_type="jsonl_text",
+            file_path=data_path,
+            tokenizer=tokenizer,
+            max_samples=max_samples,
+            max_length=max_length,
+            text_field=text_field,
+        )
+    elif data_loader == "amaia":
+        seq_len = amaia_seq_len if amaia_seq_len is not None else max_length
+        loader = create_loader(
+            loader_type="amaia",
+            amaia_sources_config=amaia_sources_config,
+            amaia_seq_len=seq_len,
+            max_samples=max_samples,
+            amaia_seed=amaia_seed,
+            amaia_shuffle_buffer_size=amaia_shuffle_buffer_size,
+            amaia_tokenizer_name=amaia_tokenizer_name,
+            amaia_tokenizer_path=amaia_tokenizer_path,
+            amaia_path=amaia_path,
+        )
+    elif data_loader == "tokens_file":
+        loader = create_loader(
+            loader_type="tokens_file",
+            token_data_path=token_data_path or data_path,
+            max_samples=max_samples,
+            token_format=token_format,
+            token_field=token_field,
+            mask_field=mask_field,
+        )
     else:
-        texts = data
+        raise ValueError(f"Unknown data_loader: {data_loader}. Choose from: jsonl_text, amaia, tokens_file")
+
+    samples = loader.load()
+    print(f"Loaded {len(samples)} samples via {loader.get_description()}")
+
+    # For backward compatibility with multi-GPU and existing code that uses texts,
+    # we also extract texts if samples have no masks (pure text mode)
+    texts = None
+    if use_multi_gpu:
+        # Multi-GPU mode still uses texts for now (will update worker functions separately)
+        # For samples with masks, we'll need to serialize and pass samples
+        if all(s.mask is None for s in samples):
+            # No masks, we can use the old text-based approach by re-loading
+            if data_loader == "jsonl_text":
+                data = load_jsonl_dataset(data_path, max_samples=max_samples)
+                if isinstance(data[0], dict):
+                    if "text" in data[0]:
+                        texts = [item["text"] for item in data]
+                    elif "content" in data[0]:
+                        texts = [item["content"] for item in data]
+                    else:
+                        first_key = list(data[0].keys())[0]
+                        texts = [item[first_key] for item in data]
+                else:
+                    texts = data
+            else:
+                # For other loaders without masks in multi-GPU, convert samples to serializable
+                texts = [s.to_serializable() for s in samples]  # Pass serialized samples
+        else:
+            # With masks, serialize samples for multi-GPU
+            texts = [s.to_serializable() for s in samples]
 
     # Run baseline evaluation
     print("\n" + "-" * 80)
@@ -1004,7 +1232,7 @@ def evaluate_ppl_chunked(
         )
     else:
         baseline_results = calculate_perplexity_chunked(
-            model=model, tokenizer=tokenizer, texts=texts,
+            model=model, tokenizer=tokenizer, samples=samples,
             max_length=max_length, chunk_size=chunk_size, press=None, device=device,
         )
 
@@ -1020,7 +1248,7 @@ def evaluate_ppl_chunked(
             print("-" * 80)
 
             result = run_single_threshold(
-                texts=texts, model=model, tokenizer=tokenizer,
+                texts=texts, samples=samples, model=model, tokenizer=tokenizer,
                 model_name=model_name, max_length=max_length, chunk_size=chunk_size,
                 kvzap_model_type=kvzap_model_type, kvzap_scorer_model=kvzap_scorer_model,
                 threshold=thresh, device=device, use_multi_gpu=use_multi_gpu,
@@ -1053,7 +1281,7 @@ def evaluate_ppl_chunked(
         "data_path": data_path,
         "max_length": max_length,
         "chunk_size": chunk_size,
-        "num_samples": len(texts),
+        "num_samples": len(samples),
         "kvzap_model_type": kvzap_model_type,
         "sliding_window_size": DMS_SLIDING_WINDOW_SIZE,
         "multi_gpu": use_multi_gpu,

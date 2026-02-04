@@ -1,0 +1,53 @@
+{
+  "baseline_perplexity": 6.567224335041404,
+  "baseline_nll": 1.8820912675879646,
+  "comparisons": [
+    {
+      "method": "KVzap(no_sink)",
+      "method_key": "kvzap(no_sink)",
+      "perplexity": 6.567224335041404,
+      "avg_nll": 1.8820912675879646,
+      "ppl_delta": 0.0,
+      "ppl_delta_pct": 0.0,
+      "nll_delta": 0.0,
+      "nll_delta_pct": 0.0,
+      "density_overall": -436.69716250998533,
+      "density_compressible": -445.9236554019797
+    },
+    {
+      "method": "H2O",
+      "method_key": "h2o",
+      "perplexity": 6.567224335041404,
+      "avg_nll": 1.8820912675879646,
+      "ppl_delta": 0.0,
+      "ppl_delta_pct": 0.0,
+      "nll_delta": 0.0,
+      "nll_delta_pct": 0.0,
+      "density_overall": -892.8581970879299,
+      "density_compressible": -909.9266664931873
+    }
+  ],
+  "configuration": {
+    "model_name": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    "data_path": "/checkpoint/amaia/scale/manufay/ppl_data/govreport.val.jsonl",
+    "max_samples": 100,
+    "max_length": 8192,
+    "chunk_size": 128,
+    "thresholds": {
+      "kvzap": -5.5,
+      "kvzap_no_sink": -5.5,
+      "expected_attention": 0.3,
+      "random": 0.8,
+      "random_validation": 1.0,
+      "observed_attention": 0.05,
+      "h2o": 0.05
+    },
+    "sliding_window_size": 128,
+    "kvzap_model_type": "mlp",
+    "kvzap_scorer_model": "nvidia/KVzap-mlp-Llama-3.1-8B-Instruct",
+    "num_texts": 100,
+    "data_loader": "jsonl_text",
+    "num_gpus": -1,
+    "use_multigpu": true
+  }
+}

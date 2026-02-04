@@ -1,0 +1,32 @@
+{
+  "config": {
+    "amaia_sources_config": "/home/manufay/kvpress/kvzap/amaia_sources.yaml",
+    "max_samples": 200,
+    "max_length": 8192
+  },
+  "qwen3_8b": {
+    "model": "Qwen/Qwen3-8B",
+    "perplexity": 7.736526970717928,
+    "avg_nll": 2.0459528751068246,
+    "total_tokens": 1638200,
+    "num_samples": 200
+  },
+  "dms_8x": {
+    "model": "nvidia/Qwen3-8B-DMS-8x",
+    "perplexity": 7.737433758795291,
+    "avg_nll": 2.046070076913686,
+    "total_tokens": 1638200,
+    "num_samples": 200,
+    "density_with_window": 0.06752220153808594,
+    "density_without_window": 0.005357014973958333,
+    "cr_with_window": 14.814847821529122,
+    "cr_without_window": 200.540715198325,
+    "target_compression_ratio": 8,
+    "dms_window_size": 512
+  },
+  "comparison": {
+    "nll_delta": 0.00011720180686136672,
+    "ppl_delta": 0.0009067880773629966,
+    "ppl_ratio": 1.0001172086752614
+  }
+}

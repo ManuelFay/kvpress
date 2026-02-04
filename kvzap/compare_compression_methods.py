@@ -103,6 +103,7 @@ from kvpress import (
     DMSPress,
 )
 from kvpress.presses.h2o_press import H2OPress
+from kvpress.presses.observed_attention_press import ObservedAttentionPress
 
 # Import from existing evaluation script
 from evaluate_ppl_chunked import (
@@ -113,6 +114,7 @@ from evaluate_ppl_chunked import (
     get_available_gpus,
     aggregate_results,
 )
+from kvzap.loaders import Sample, create_loader
 
 
 # ==============================================================================
@@ -125,7 +127,11 @@ DEFAULT_THRESHOLDS = {
     # KVzap: Uses log-probabilities (negative values)
     # More negative = less important tokens
     # Range: typically -10 to 0
-    "kvzap": -6.0,
+    "kvzap": -6.5,
+
+    # KVzap without sink tokens (n_sink=0)
+    # Same threshold as regular kvzap for fair comparison
+    "kvzap_no_sink": -6.5,
 
     # ExpectedAttention (with vnorm=True): Softmax probabilities × value norms
     # Scores typically in range [0, 10]
@@ -140,15 +146,72 @@ DEFAULT_THRESHOLDS = {
     # (keeps only sink + window, evicts everything else)
     "random_validation": 1.0,
 
-    # ObservedAttention: Average attention weights
-    # Scores are small positive values (avg ≈ 1/seq_len)
-    # For seq_len=1000, avg score ≈ 0.001
-    "observed_attention": 0.0005,
+    # ObservedAttention: Uses target_density by default (see DEFAULT_DENSITIES)
+    # If threshold is needed, typical values are 0.001-0.05
+    "observed_attention": None,
 
-    # H2O: Same as ObservedAttention but with local window protection
-    # Uses observed attention scores + infinite scores for local window
-    "h2o": 0.0005,
+    # H2O: Uses target_density by default (see DEFAULT_DENSITIES)
+    # If threshold is needed, typical values are 0.001-0.05
+    "h2o": None,
 }
+
+# Default target densities for methods that benefit from adaptive thresholds
+# target_density = fraction of compressible tokens to keep (0.0 to 1.0)
+# This is preferred over fixed thresholds for observed attention methods
+# because attention score distributions vary with sequence length.
+DEFAULT_DENSITIES = {
+    # ObservedAttention: Keep 30% of compressible tokens
+    "observed_attention": 0.2,
+
+    # H2O: Keep 30% of compressible tokens (same as observed_attention)
+    "h2o": 0.2,
+}
+
+
+
+DEFAULT_THRESHOLDS = {
+    # KVzap: Uses log-probabilities (negative values)
+    # More negative = less important tokens
+    # Range: typically -10 to 0
+    "kvzap": -5,
+
+    # KVzap without sink tokens (n_sink=0)
+    # Same threshold as regular kvzap for fair comparison
+    "kvzap_no_sink": -5,
+
+    # ExpectedAttention (with vnorm=True): Softmax probabilities × value norms
+    # Scores typically in range [0, 10]
+    # Higher threshold = more aggressive compression
+    "expected_attention": 0.35,
+
+    # Random: Uniform random scores in [0, 1]
+    # threshold=0.5 evicts ~50% of tokens
+    "random": 0.85,
+    # Random validation: threshold=1.0 should match StreamingLLM
+    # (keeps only sink + window, evicts everything else)
+    "random_validation": 1.0,
+
+    # ObservedAttention: Uses target_density by default (see DEFAULT_DENSITIES)
+    # If threshold is needed, typical values are 0.001-0.05
+    "observed_attention": None,
+
+    # H2O: Uses target_density by default (see DEFAULT_DENSITIES)
+    # If threshold is needed, typical values are 0.001-0.05
+    "h2o": None,
+}
+
+# Default target densities for methods that benefit from adaptive thresholds
+# target_density = fraction of compressible tokens to keep (0.0 to 1.0)
+# This is preferred over fixed thresholds for observed attention methods
+# because attention score distributions vary with sequence length.
+DEFAULT_DENSITIES = {
+    # ObservedAttention: Keep 30% of compressible tokens
+    "observed_attention": 0.15,
+
+    # H2O: Keep 30% of compressible tokens (same as observed_attention)
+    "h2o": 0.15,
+}
+
 
 
 # ==============================================================================
@@ -157,12 +220,13 @@ DEFAULT_THRESHOLDS = {
 
 def visualize_compression_heatmap(
     scores_dict: Dict[str, torch.Tensor],
-    threshold: float,
+    threshold: Optional[float],
     method_name: str,
     output_dir: Path,
     max_tokens: int = 1024,
     sliding_window_size: int = 128,
     n_sink: int = 0,
+    target_density: Optional[float] = None,
 ):
     """
     Create a heatmap visualization showing which tokens are kept/evicted per layer.
@@ -172,7 +236,7 @@ def visualize_compression_heatmap(
     scores_dict : dict[int, torch.Tensor]
         Dictionary mapping layer_idx -> binary decisions tensor (batch, num_heads, seq_len)
         where 1 = kept, 0 = evicted (already computed, not raw scores)
-    threshold : float
+    threshold : float, optional
         Threshold value used (for display purposes only)
     method_name : str
         Name of the compression method
@@ -184,6 +248,8 @@ def visualize_compression_heatmap(
         Size of the sliding window (these tokens are protected)
     n_sink : int
         Number of sink tokens (these tokens are protected)
+    target_density : float, optional
+        Target density used (for display purposes only)
     """
     if not scores_dict:
         print(f"  No scores to visualize for {method_name}")
@@ -247,10 +313,6 @@ def visualize_compression_heatmap(
     density_overall = (keys_kept_total / total_keys * 100) if total_keys > 0 else 0
     density_compressible = (keys_kept_in_compressible / total_compressible_keys * 100) if total_compressible_keys > 0 else 0
 
-    print(f"    DEBUG: total_keys={total_keys} (tokens={seq_len} × layers={num_layers} × heads={num_heads})")
-    print(f"    DEBUG: protected_keys={total_protected_keys}, compressible_keys={total_compressible_keys}")
-    print(f"    DEBUG: keys_kept_total={int(keys_kept_total)}, keys_kept_compressible={int(keys_kept_in_compressible)}")
-
     # For visualization, average across heads for each layer: (num_layers, seq_len)
     # This gives us the fraction of heads that kept each token at each layer
     layer_avg_decisions = decisions_tensor.mean(dim=1).numpy()
@@ -289,7 +351,13 @@ def visualize_compression_heatmap(
     ax1.set_xlabel('Token Position', fontsize=10)
 
     # Enhanced title with density metrics
-    title_line1 = f'{method_name} - Compression State at {seq_len} Tokens (threshold={threshold:.6f})'
+    if target_density is not None:
+        param_str = f'target_density={target_density:.2f}'
+    elif threshold is not None:
+        param_str = f'threshold={threshold:.6f}'
+    else:
+        param_str = 'default params'
+    title_line1 = f'{method_name} - Compression State at {seq_len} Tokens ({param_str})'
     title_line2 = f'Overall Density: {density_overall:.2f}% ({int(keys_kept_total)}/{total_keys} keys) | Compressible Region Density: {density_compressible:.2f}% ({int(keys_kept_in_compressible)}/{total_compressible_keys} keys)'
     ax1.set_title(f'{title_line1}\n{title_line2}', fontsize=11, pad=10)
 
@@ -353,7 +421,7 @@ def visualize_compression_heatmap(
 def capture_scores_first_sample(
     model,
     tokenizer,
-    text: str,
+    text,  # Can be str, Sample, or serialized dict
     press,
     max_length: int = 8192,
     chunk_size: int = 128,
@@ -368,6 +436,9 @@ def capture_scores_first_sample(
 
     Parameters
     ----------
+    text : str, Sample, or dict
+        Either a text string (will be tokenized), a Sample object (uses pre-tokenized),
+        or a serialized sample dict (from Sample.to_serializable())
     target_tokens : int
         Number of tokens to process before capturing (default: 1024)
 
@@ -379,9 +450,26 @@ def capture_scores_first_sample(
     """
     model.eval()
 
-    # Tokenize
-    encodings = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length)
-    input_ids = encodings.input_ids.to(device)
+    # Handle different input types
+    if isinstance(text, str):
+        # Regular text string - tokenize it
+        encodings = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length)
+        input_ids = encodings.input_ids.to(device)
+    elif isinstance(text, dict) and "tokens" in text:
+        # Serialized sample dict
+        tokens = text["tokens"]
+        if len(tokens) > max_length:
+            tokens = tokens[:max_length]
+        input_ids = torch.tensor([tokens], device=device)
+    elif hasattr(text, "tokens"):
+        # Sample object
+        tokens = text.tokens
+        if len(tokens) > max_length:
+            tokens = tokens[:max_length]
+        input_ids = torch.tensor([tokens], device=device)
+    else:
+        raise ValueError(f"Unsupported text type: {type(text)}. Expected str, Sample, or dict with 'tokens' key.")
+
     seq_len = input_ids.size(1)
 
     if seq_len < 2:
@@ -397,16 +485,18 @@ def capture_scores_first_sample(
     num_chunks_to_process = min(num_chunks_to_process, max_possible_chunks)
 
     with torch.inference_mode():
-        for chunk_idx in range(num_chunks_to_process):
-            start_pos = chunk_idx * chunk_size
-            end_pos = min((chunk_idx + 1) * chunk_size, seq_len)
-            chunk_ids = input_ids[:, start_pos:end_pos]
+        # CRITICAL: Keep press context open across ALL chunks
+        # This ensures masked_key_indices persist between chunks for correct eviction
+        if press is not None:
+            with press(model):
+                for chunk_idx in range(num_chunks_to_process):
+                    start_pos = chunk_idx * chunk_size
+                    end_pos = min((chunk_idx + 1) * chunk_size, seq_len)
+                    chunk_ids = input_ids[:, start_pos:end_pos]
 
-            position_ids = torch.arange(start_pos, end_pos, device=device).unsqueeze(0)
-            cache_position = torch.arange(start_pos, end_pos, device=device)
+                    position_ids = torch.arange(start_pos, end_pos, device=device).unsqueeze(0)
+                    cache_position = torch.arange(start_pos, end_pos, device=device)
 
-            if press is not None:
-                with press(model):
                     outputs = model(
                         input_ids=chunk_ids,
                         position_ids=position_ids,
@@ -416,8 +506,52 @@ def capture_scores_first_sample(
                         output_attentions=True,  # Required for H2O and ObservedAttention
                         return_dict=True,
                     )
-            else:
-                # Baseline - no compression
+
+                # CRITICAL: Capture binary decisions INSIDE the press context
+                # masked_key_indices is cleared when context exits, so we must capture here
+                actual_tokens_processed = min(num_chunks_to_process * chunk_size, seq_len)
+                print(f"    Processed {num_chunks_to_process} chunks = {actual_tokens_processed} tokens for visualization")
+
+                # Reconstruct which positions were kept/evicted by looking at masked_key_indices
+                binary_decisions = {}
+                num_kv_heads = model.config.num_key_value_heads
+                batch_size = 1
+
+                for layer_idx, layer in enumerate(model.model.layers):
+                    attn_module = layer.self_attn
+
+                    # Check if this layer has masked indices (evicted positions)
+                    if hasattr(attn_module, 'masked_key_indices') and attn_module.masked_key_indices is not None:
+                        # Start with all positions kept (1)
+                        kept_mask = torch.ones(batch_size, num_kv_heads, actual_tokens_processed,
+                                              dtype=torch.float32, device=device)
+
+                        # Mark evicted positions as 0
+                        if len(attn_module.masked_key_indices) >= 3:
+                            batch_idx = attn_module.masked_key_indices[0]
+                            head_idx = attn_module.masked_key_indices[1]
+                            pos_idx = attn_module.masked_key_indices[2]
+
+                            # Only include positions < actual_tokens_processed
+                            valid_mask = pos_idx < actual_tokens_processed
+                            if valid_mask.any():
+                                kept_mask[batch_idx[valid_mask], head_idx[valid_mask], pos_idx[valid_mask]] = 0.0
+
+                        binary_decisions[layer_idx] = kept_mask.cpu()
+                    else:
+                        # No eviction happened - all tokens kept
+                        binary_decisions[layer_idx] = torch.ones(batch_size, num_kv_heads, actual_tokens_processed,
+                                                                 dtype=torch.float32)
+        else:
+            # Baseline - no compression
+            for chunk_idx in range(num_chunks_to_process):
+                start_pos = chunk_idx * chunk_size
+                end_pos = min((chunk_idx + 1) * chunk_size, seq_len)
+                chunk_ids = input_ids[:, start_pos:end_pos]
+
+                position_ids = torch.arange(start_pos, end_pos, device=device).unsqueeze(0)
+                cache_position = torch.arange(start_pos, end_pos, device=device)
+
                 outputs = model(
                     input_ids=chunk_ids,
                     position_ids=position_ids,
@@ -427,43 +561,16 @@ def capture_scores_first_sample(
                     return_dict=True,
                 )
 
-    actual_tokens_processed = min(num_chunks_to_process * chunk_size, seq_len)
-    print(f"    Processed {num_chunks_to_process} chunks = {actual_tokens_processed} tokens for visualization")
+            # Baseline: all tokens kept
+            actual_tokens_processed = min(num_chunks_to_process * chunk_size, seq_len)
+            print(f"    Processed {num_chunks_to_process} chunks = {actual_tokens_processed} tokens for visualization")
 
-    # Now reconstruct which positions were kept/evicted by looking at masked_key_indices
-    binary_decisions = {}
-
-    # Get num_key_value_heads from model config
-    num_kv_heads = model.config.num_key_value_heads
-    batch_size = 1
-
-    # Get attention modules from model
-    for layer_idx, layer in enumerate(model.model.layers):
-        attn_module = layer.self_attn
-
-        # Check if this layer has masked indices (evicted positions)
-        if hasattr(attn_module, 'masked_key_indices') and attn_module.masked_key_indices is not None:
-            # Start with all positions kept (1)
-            kept_mask = torch.ones(batch_size, num_kv_heads, actual_tokens_processed,
-                                  dtype=torch.float32, device=device)
-
-            # Mark evicted positions as 0
-            # masked_key_indices is a list of tensors: [batch_indices, head_indices, position_indices]
-            if len(attn_module.masked_key_indices) >= 3:
-                batch_idx = attn_module.masked_key_indices[0]
-                head_idx = attn_module.masked_key_indices[1]
-                pos_idx = attn_module.masked_key_indices[2]
-
-                # Only include positions < actual_tokens_processed
-                valid_mask = pos_idx < actual_tokens_processed
-                if valid_mask.any():
-                    kept_mask[batch_idx[valid_mask], head_idx[valid_mask], pos_idx[valid_mask]] = 0.0
-
-            binary_decisions[layer_idx] = kept_mask.cpu()
-        else:
-            # No eviction happened - all tokens kept
-            binary_decisions[layer_idx] = torch.ones(batch_size, num_kv_heads, actual_tokens_processed,
-                                                     dtype=torch.float32)
+            binary_decisions = {}
+            num_kv_heads = model.config.num_key_value_heads
+            batch_size = 1
+            for layer_idx in range(model.config.num_hidden_layers):
+                binary_decisions[layer_idx] = torch.ones(batch_size, num_kv_heads, actual_tokens_processed,
+                                                         dtype=torch.float32)
 
     if binary_decisions:
         first_layer = next(iter(binary_decisions.values()))
@@ -586,7 +693,11 @@ def create_expected_attention_press(
     )
 
 
-def create_observed_attention_press(threshold: float, sliding_window_size: int = DMS_SLIDING_WINDOW_SIZE):
+def create_observed_attention_press(
+    threshold: Optional[float] = None,
+    target_density: Optional[float] = None,
+    sliding_window_size: int = DMS_SLIDING_WINDOW_SIZE,
+):
     """
     Create ObservedAttentionPress wrapped in DMSPress for threshold-based eviction.
 
@@ -594,8 +705,11 @@ def create_observed_attention_press(threshold: float, sliding_window_size: int =
 
     Parameters
     ----------
-    threshold : float
-        Score threshold for eviction (more negative = more aggressive)
+    threshold : float, optional
+        Score threshold for eviction. Mutually exclusive with target_density.
+    target_density : float, optional
+        Target fraction of tokens to keep (0.0 to 1.0). Mutually exclusive with threshold.
+        Recommended for consistent compression across different sequence lengths.
     sliding_window_size : int
         Number of recent tokens protected from eviction
 
@@ -607,42 +721,62 @@ def create_observed_attention_press(threshold: float, sliding_window_size: int =
     return DMSPress(
         observed_scorer,
         threshold=threshold,
+        target_density=target_density,
         sliding_window_size=sliding_window_size,
         decoding=True,
+        accumulate_attention=True,  # Accumulate attention across chunks for proper scoring
     )
 
 
-def create_h2o_press(threshold: float, sliding_window_size: int = DMS_SLIDING_WINDOW_SIZE, local_window_size: int = 512):
+def create_h2o_press(
+    threshold: Optional[float] = None,
+    target_density: Optional[float] = None,
+    sliding_window_size: int = DMS_SLIDING_WINDOW_SIZE,
+    local_window_size: int = 512,
+    n_sink: int = 4,
+):
     """
-    Create H2OPress wrapped in DMSPress for threshold-based eviction.
+    Create H2O-style press using ObservedAttentionPress wrapped in DMSPress.
 
-    Combines H2O's local window preservation with threshold-based eviction.
-    More faithful to the H2O paper than plain ObservedAttention.
+    Uses observed attention scores for importance, with DMSPress handling
+    the sliding window protection and ObservedAttentionPress protecting sink tokens.
+
+    H2O (Heavy-Hitter Oracle) keeps:
+    - Sink tokens: First n_sink tokens (attention sinks, always kept)
+    - Heavy hitters: Tokens with high cumulative attention (score >= threshold)
+    - Recent window: Last sliding_window_size tokens
 
     NOTE: Requires model loaded with attn_implementation="eager"
 
     Parameters
     ----------
-    threshold : float
-        Score threshold for eviction (more negative = more aggressive)
+    threshold : float, optional
+        Score threshold for eviction. Tokens with score < threshold are evicted.
+        Mutually exclusive with target_density.
+    target_density : float, optional
+        Target fraction of tokens to keep (0.0 to 1.0). Mutually exclusive with threshold.
+        Recommended for consistent compression across different sequence lengths.
     sliding_window_size : int
         Number of recent tokens protected from eviction by DMSPress
     local_window_size : int
-        Number of most recent tokens assigned infinite scores by H2O
+        (Unused - kept for API compatibility) DMSPress handles window protection.
+    n_sink : int
+        Number of initial "sink" tokens to always preserve (default 4 for H2O).
+        These act as attention sinks where models tend to dump extra attention.
 
     Returns
     -------
-    DMSPress wrapping H2OPress
+    DMSPress wrapping ObservedAttentionPress with sink token protection
     """
-    h2o_scorer = H2OPress(
-        compression_ratio=0.0,
-        local_window_size=local_window_size,
-    )
+    # Use ObservedAttentionPress with sink tokens - DMSPress's sliding_window handles recent token protection
+    observed_attention_scorer = ObservedAttentionPress(compression_ratio=0.0, n_sink=n_sink)
     return DMSPress(
-        h2o_scorer,
+        observed_attention_scorer,
         threshold=threshold,
+        target_density=target_density,
         sliding_window_size=sliding_window_size,
         decoding=True,
+        accumulate_attention=True,  # Accumulate attention across chunks for proper H2O scoring
     )
 
 
@@ -682,6 +816,50 @@ def create_kvzap_press(
         )
     else:
         kvzap_press = KVzapPress(model_type=kvzap_model_type, n_sink=n_sink)
+
+    return DMSPress(
+        kvzap_press,
+        threshold=threshold,
+        sliding_window_size=sliding_window_size,
+        decoding=True,
+    )
+
+
+def create_kvzap_no_sink_press(
+    threshold: float,
+    kvzap_model_type: str = "mlp",
+    kvzap_scorer_model: Optional[str] = None,
+    sliding_window_size: int = DMS_SLIDING_WINDOW_SIZE,
+):
+    """
+    Create KVzap press WITHOUT sink tokens (n_sink=0).
+
+    This variant does not preserve initial tokens, only the sliding window.
+    Useful for comparing the impact of sink tokens on performance.
+
+    Parameters
+    ----------
+    threshold : float
+        Score threshold for eviction (more negative = more aggressive)
+    kvzap_model_type : str
+        Type of KVzap model ("mlp" or "linear")
+    kvzap_scorer_model : str, optional
+        Explicit HuggingFace model name for KVzap scorer
+    sliding_window_size : int
+        Number of recent tokens protected from eviction
+
+    Returns
+    -------
+    DMSPress wrapping KVzapPress with n_sink=0
+    """
+    if kvzap_scorer_model is not None:
+        kvzap_press = CustomKVzapPress(
+            model_type=kvzap_model_type,
+            explicit_model_name=kvzap_scorer_model,
+            n_sink=0  # No sink tokens
+        )
+    else:
+        kvzap_press = KVzapPress(model_type=kvzap_model_type, n_sink=0)
 
     return DMSPress(
         kvzap_press,
@@ -736,6 +914,21 @@ def worker_evaluate_all_methods(
         device = f"cuda:{gpu_id}"
         torch.cuda.set_device(gpu_id)
 
+        # Determine input representation (raw text vs serialized samples)
+        worker_samples = None
+        use_serialized_samples = False
+        if texts:
+            first_item = texts[0]
+            if isinstance(first_item, Sample):
+                worker_samples = list(texts)
+                use_serialized_samples = True
+            elif isinstance(first_item, dict) and "tokens" in first_item:
+                worker_samples = [
+                    sample if isinstance(sample, Sample) else Sample.from_serializable(sample)
+                    for sample in texts
+                ]
+                use_serialized_samples = True
+
         # Determine if any method requires eager attention
         any_requires_eager = any(m.get("requires_eager", False) for m in methods_config)
 
@@ -780,6 +973,8 @@ def worker_evaluate_all_methods(
                     press = create_expected_attention_press(**press_params)
                 elif press_type == "kvzap":
                     press = create_kvzap_press(**press_params)
+                elif press_type == "kvzap_no_sink":
+                    press = create_kvzap_no_sink_press(**press_params)
                 elif press_type == "observed_attention":
                     press = create_observed_attention_press(**press_params)
                 elif press_type == "h2o":
@@ -790,7 +985,8 @@ def worker_evaluate_all_methods(
             results = calculate_perplexity_chunked(
                 model=model,
                 tokenizer=tokenizer,
-                texts=texts,
+                texts=None if use_serialized_samples else texts,
+                samples=worker_samples if use_serialized_samples else None,
                 max_length=max_length,
                 chunk_size=chunk_size,
                 press=press,
@@ -866,6 +1062,21 @@ def worker_evaluate_texts(
         device = f"cuda:{gpu_id}"
         torch.cuda.set_device(gpu_id)
 
+        # Determine input representation (raw text vs serialized samples)
+        worker_samples = None
+        use_serialized_samples = False
+        if texts:
+            first_item = texts[0]
+            if isinstance(first_item, Sample):
+                worker_samples = list(texts)
+                use_serialized_samples = True
+            elif isinstance(first_item, dict) and "tokens" in first_item:
+                worker_samples = [
+                    sample if isinstance(sample, Sample) else Sample.from_serializable(sample)
+                    for sample in texts
+                ]
+                use_serialized_samples = True
+
         # Determine if we need eager attention mode
         requires_eager = press_type in ["observed_attention", "h2o"]
 
@@ -896,6 +1107,8 @@ def worker_evaluate_texts(
                 press = create_expected_attention_press(**press_params)
             elif press_type == "kvzap":
                 press = create_kvzap_press(**press_params)
+            elif press_type == "kvzap_no_sink":
+                press = create_kvzap_no_sink_press(**press_params)
             elif press_type == "observed_attention":
                 press = create_observed_attention_press(**press_params)
             elif press_type == "h2o":
@@ -1265,10 +1478,11 @@ def evaluate_with_press(
 # ==============================================================================
 
 def compare_compression_methods(
-    data_path: str,
+    data_path: str = None,
     model_name: str = "meta-llama/Meta-Llama-3.1-8B-Instruct",
     compression_ratio: float = 0.5,
     thresholds: Optional[Dict[str, float]] = None,
+    densities: Optional[Dict[str, float]] = None,
     sliding_window_size: int = DMS_SLIDING_WINDOW_SIZE,
     kvzap_scorer_model: Optional[str] = None,
     kvzap_model_type: str = "mlp",
@@ -1282,6 +1496,21 @@ def compare_compression_methods(
     h2o_local_window_size: int = 512,
     num_gpus: Optional[int] = None,
     visualize_first_sample: bool = True,
+    # New loader selection args
+    data_loader: str = "jsonl_text",
+    text_field: str = None,
+    # AMAIA loader args
+    amaia_sources_config: str = None,
+    amaia_seq_len: int = None,
+    amaia_seed: int = 42,
+    amaia_shuffle_buffer_size: int = 1,
+    amaia_tokenizer_name: str = "tiktoken",
+    amaia_tokenizer_path: str = None,
+    amaia_path: str = "/storage/home/manufay/amaia",
+    # Token file loader args
+    token_data_path: str = None,
+    token_format: str = "auto",
+    token_field_names: str = None,
 ):
     """
     Compare different KV cache compression methods.
@@ -1348,18 +1577,48 @@ def compare_compression_methods(
     dict
         Comparison results
     """
+    # Parse thresholds if passed as JSON string (from command line)
+    if thresholds is not None and thresholds != "":
+        if isinstance(thresholds, str):
+            try:
+                thresholds = json.loads(thresholds)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Failed to parse thresholds JSON string: {e}\nProvided: {repr(thresholds)}")
+
+        # Validate thresholds is a dict
+        if not isinstance(thresholds, dict):
+            raise ValueError(f"thresholds must be a dict, got {type(thresholds)}: {thresholds}")
+    elif thresholds == "":
+        # Fire passes empty string when not provided
+        thresholds = None
+
     # Determine which methods to run
     if methods is None:
-        methods_to_run = ["random", "random_validation", "streaming_llm", "expected_attention", "kvzap"]
+        methods_to_run = ["h2o", "observed_attention", "kvzap", "random", "streaming_llm", "expected_attention"]
         if include_observed_attention:
-            methods_to_run.extend(["observed_attention", "h2o"])
+            methods_to_run.extend(["observed_attention"])
     else:
-        methods_to_run = methods
+        # Handle Fire CLI passing a string instead of a list
+        if isinstance(methods, str):
+            # Could be comma-separated or a single method
+            if "," in methods:
+                methods_to_run = [m.strip() for m in methods.split(",") if m.strip()]
+            else:
+                methods_to_run = [methods.strip()]
+        elif isinstance(methods, (list, tuple)):
+            methods_to_run = list(methods)
+        else:
+            raise ValueError(f"methods must be a list or string, got {type(methods)}: {methods}")
 
     # Merge user-provided thresholds with defaults
     active_thresholds = DEFAULT_THRESHOLDS.copy()
     if thresholds is not None:
         active_thresholds.update(thresholds)
+
+    # Merge user-provided densities with defaults
+    active_densities = DEFAULT_DENSITIES.copy()
+    if densities is not None:
+        active_densities.update(densities)
 
     # Determine if using multi-GPU (needed for configuration display)
     use_multigpu = num_gpus is not None and num_gpus != 1
@@ -1387,10 +1646,16 @@ def compare_compression_methods(
     print(f"  Chunk size: {chunk_size}")
     if not use_multigpu:
         print(f"  No-chunking baseline: Will be evaluated (single-GPU mode only)")
-    print(f"  Thresholds:")
-    for method, thresh in active_thresholds.items():
-        if method in methods_to_run or (method == "h2o" and "h2o" in methods_to_run) or (method == "observed_attention" and "observed_attention" in methods_to_run):
-            print(f"    - {method}: {thresh}")
+    print(f"  Thresholds/Densities:")
+    for method in methods_to_run:
+        thresh = active_thresholds.get(method)
+        density = active_densities.get(method)
+        if density is not None:
+            print(f"    - {method}: target_density={density}")
+        elif thresh is not None:
+            print(f"    - {method}: threshold={thresh}")
+        else:
+            print(f"    - {method}: (using defaults)")
     print(f"  Sliding window size: {sliding_window_size}")
     print(f"  Methods: {', '.join(methods_to_run)}")
     if num_gpus is not None:
@@ -1433,22 +1698,84 @@ def compare_compression_methods(
             )
         model.eval()
 
-    # Load dataset
-    print(f"Loading dataset: {data_path}")
-    data = load_jsonl_dataset(data_path, max_samples=max_samples)
-    print(f"Loaded {len(data)} samples")
+    # Validate loader arguments
+    if data_loader == "jsonl_text" and data_path is None:
+        raise ValueError("--data_path is required for jsonl_text loader")
+    if data_loader == "amaia" and amaia_sources_config is None:
+        raise ValueError("--amaia_sources_config is required for amaia loader")
+    if data_loader == "tokens_file" and token_data_path is None and data_path is None:
+        raise ValueError("--token_data_path (or --data_path) is required for tokens_file loader")
 
-    # Extract text from data
-    if isinstance(data[0], dict):
-        if "text" in data[0]:
-            texts = [item["text"] for item in data]
-        elif "content" in data[0]:
-            texts = [item["content"] for item in data]
-        else:
-            first_key = list(data[0].keys())[0]
-            texts = [item[first_key] for item in data]
+    # Parse token field names if provided
+    token_field = "tokens"
+    mask_field = "mask"
+    if token_field_names:
+        parts = token_field_names.split(",")
+        token_field = parts[0].strip()
+        if len(parts) > 1:
+            mask_field = parts[1].strip()
+
+    # Load dataset using the appropriate loader
+    print(f"\nLoading dataset using {data_loader} loader...")
+
+    if data_loader == "jsonl_text":
+        # For jsonl_text, we need the tokenizer to create the loader
+        if tokenizer is None:
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+        loader = create_loader(
+            loader_type="jsonl_text",
+            file_path=data_path,
+            tokenizer=tokenizer,
+            max_samples=max_samples,
+            max_length=max_length,
+            text_field=text_field,
+        )
+    elif data_loader == "amaia":
+        seq_len = amaia_seq_len if amaia_seq_len is not None else max_length
+        loader = create_loader(
+            loader_type="amaia",
+            amaia_sources_config=amaia_sources_config,
+            amaia_seq_len=seq_len,
+            max_samples=max_samples,
+            amaia_seed=amaia_seed,
+            amaia_shuffle_buffer_size=amaia_shuffle_buffer_size,
+            amaia_tokenizer_name=amaia_tokenizer_name,
+            amaia_tokenizer_path=amaia_tokenizer_path,
+            amaia_path=amaia_path,
+        )
+    elif data_loader == "tokens_file":
+        loader = create_loader(
+            loader_type="tokens_file",
+            token_data_path=token_data_path or data_path,
+            max_samples=max_samples,
+            token_format=token_format,
+            token_field=token_field,
+            mask_field=mask_field,
+        )
     else:
-        texts = data
+        raise ValueError(f"Unknown data_loader: {data_loader}. Choose from: jsonl_text, amaia, tokens_file")
+
+    samples = loader.load()
+    print(f"Loaded {len(samples)} samples via {loader.get_description()}")
+
+    # For backward compatibility, also extract texts for multi-GPU and visualization
+    texts = None
+    if use_multigpu or visualize_first_sample:
+        if data_loader == "jsonl_text" and data_path:
+            data = load_jsonl_dataset(data_path, max_samples=max_samples)
+            if isinstance(data[0], dict):
+                if "text" in data[0]:
+                    texts = [item["text"] for item in data]
+                elif "content" in data[0]:
+                    texts = [item["content"] for item in data]
+                else:
+                    first_key = list(data[0].keys())[0]
+                    texts = [item[first_key] for item in data]
+            else:
+                texts = data
+        else:
+            # For other loaders, serialize samples
+            texts = [s.to_serializable() for s in samples]
 
     # Create output directory for results and visualizations
     output_path = Path(output_dir)
@@ -1536,13 +1863,31 @@ def compare_compression_methods(
             "requires_eager": False,
         })
 
+    # KVzap Press (No Sink Tokens)
+    if "kvzap_no_sink" in methods_to_run:
+        methods_config.append({
+            "method_name": "KVzap(no_sink)",
+            "press_type": "kvzap_no_sink",
+            "press_params": {
+                "threshold": active_thresholds["kvzap_no_sink"],
+                "kvzap_model_type": kvzap_model_type,
+                "kvzap_scorer_model": kvzap_scorer_model,
+                "sliding_window_size": DMS_SLIDING_WINDOW_SIZE,
+            },
+            "requires_eager": False,
+        })
+
     # ObservedAttention Press (requires eager)
     if "observed_attention" in methods_to_run:
+        # Use target_density from DEFAULT_DENSITIES, or fall back to threshold
+        obs_density = active_densities.get("observed_attention")
+        obs_threshold = active_thresholds.get("observed_attention")
         methods_config.append({
             "method_name": "ObservedAttention",
             "press_type": "observed_attention",
             "press_params": {
-                "threshold": active_thresholds["observed_attention"],
+                "threshold": obs_threshold,
+                "target_density": obs_density,
                 "sliding_window_size": sliding_window_size
             },
             "requires_eager": True,
@@ -1550,13 +1895,18 @@ def compare_compression_methods(
 
     # H2O Press (requires eager)
     if "h2o" in methods_to_run:
+        # Use target_density from DEFAULT_DENSITIES, or fall back to threshold
+        h2o_density = active_densities.get("h2o")
+        h2o_threshold = active_thresholds.get("h2o")
         methods_config.append({
             "method_name": "H2O",
             "press_type": "h2o",
             "press_params": {
-                "threshold": active_thresholds["h2o"],
+                "threshold": h2o_threshold,
+                "target_density": h2o_density,
                 "sliding_window_size": sliding_window_size,
                 "local_window_size": h2o_local_window_size,
+                "n_sink": 4,  # H2O uses 4 sink tokens by default
             },
             "requires_eager": True,
         })
@@ -1622,7 +1972,7 @@ def compare_compression_methods(
         result_no_chunk = calculate_perplexity_chunked(
             model=model,
             tokenizer=tokenizer,
-            texts=texts,
+            samples=samples,
             max_length=max_length,
             chunk_size=max_length,  # Process entire sequence at once
             press=None,
@@ -1657,6 +2007,8 @@ def compare_compression_methods(
                     press = create_expected_attention_press(**press_params)
                 elif press_type == "kvzap":
                     press = create_kvzap_press(**press_params)
+                elif press_type == "kvzap_no_sink":
+                    press = create_kvzap_no_sink_press(**press_params)
                 elif press_type == "observed_attention":
                     press = create_observed_attention_press(**press_params)
                 elif press_type == "h2o":
@@ -1665,7 +2017,7 @@ def compare_compression_methods(
             result = calculate_perplexity_chunked(
                 model=model,
                 tokenizer=tokenizer,
-                texts=texts,
+                samples=samples,
                 max_length=max_length,
                 chunk_size=chunk_size,
                 press=press,
@@ -1713,6 +2065,8 @@ def compare_compression_methods(
                     viz_press = create_expected_attention_press(**press_params)
                 elif press_type == "kvzap":
                     viz_press = create_kvzap_press(**press_params)
+                elif press_type == "kvzap_no_sink":
+                    viz_press = create_kvzap_no_sink_press(**press_params)
                 elif press_type == "observed_attention":
                     viz_press = create_observed_attention_press(**press_params)
                 elif press_type == "h2o":
@@ -1731,8 +2085,9 @@ def compare_compression_methods(
                         device=device,
                     )
 
-                    # Determine threshold and n_sink for this method
-                    threshold = press_params.get("threshold", 0.5) if press_params else 0.5
+                    # Determine threshold, target_density, and n_sink for this method
+                    threshold = press_params.get("threshold") if press_params else None
+                    target_density = press_params.get("target_density") if press_params else None
                     n_sink = press_params.get("n_sink", 0) if press_params else 0
 
                     # Generate visualization
@@ -1744,6 +2099,7 @@ def compare_compression_methods(
                         max_tokens=1024,
                         sliding_window_size=sliding_window_size,
                         n_sink=n_sink,
+                        target_density=target_density,
                     )
 
     baseline_ppl = all_results["baseline"]["perplexity"]
@@ -1865,7 +2221,8 @@ def compare_compression_methods(
             "sliding_window_size": sliding_window_size,
             "kvzap_model_type": kvzap_model_type,
             "kvzap_scorer_model": kvzap_scorer_model,
-            "num_texts": len(texts),
+            "num_texts": len(samples),
+            "data_loader": data_loader,
             "num_gpus": num_gpus,
             "use_multigpu": use_multigpu,
         },

@@ -1,0 +1,11 @@
+{
+  "model": "Qwen/Qwen3-8B",
+  "data_path": "/home/manufay/govreport.val.jsonl",
+  "max_samples": 10,
+  "max_length": 4096,
+  "perplexity": 8.683851934278778,
+  "avg_nll": 2.1614652014652016,
+  "total_nll": 88512.0,
+  "total_tokens": 40950,
+  "num_samples": 10
+}

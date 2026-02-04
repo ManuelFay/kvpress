@@ -1,0 +1,8 @@
+# AMAIA sources configuration for compare_compression_methods.py
+# Based on /storage/home/manufay/amaia/apps/llm/configs/manufay/eval.yaml
+
+sources:
+  - path: /home/manufay/govreport.val.jsonl
+    type: pretrain
+    wrap: false  # Disables packing across document boundaries
+    
