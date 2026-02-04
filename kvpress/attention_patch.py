@@ -58,11 +58,12 @@ def attention_patch(func):
         The wrapped attention function that supports head-wise key masking.
     """
 
-    def wrapper(module, query, key, value, attention_mask, dropout, **kwargs):
+    def wrapper(module, query, key, value, attention_mask, *args, **kwargs):
         if query.shape[2] == key.shape[2]:
             # Prefilling
             module.masked_key_indices = None
         elif getattr(module, "masked_key_indices", None) is not None:
+
             # Decoding: build fake keys k s.t. exp(<q, k>) = 0
             bsz, num_heads, seq_len, head_dim = query.shape
             num_key_value_heads = key.shape[1]
@@ -82,7 +83,7 @@ def attention_patch(func):
         # cu_seq_lens_k are only in kwargs if model.generate is used.
         if "cu_seq_lens_k" in kwargs:
             kwargs["cu_seq_lens_k"][-1] = key.shape[-2]
-        return func(module, query, key, value, attention_mask, dropout, **kwargs)
+        return func(module, query, key, value, attention_mask, *args, **kwargs)
 
     return wrapper
 
@@ -106,5 +107,33 @@ def patch_attention_functions():
     library. The modifications do not affect models that don't use head-wise compression (i.e. don't have
     module.masked_key_indices).
     """
+    # Patch ALL_ATTENTION_FUNCTIONS (used by sdpa, flash_attention, etc.)
     for name, func in ALL_ATTENTION_FUNCTIONS.items():
         ALL_ATTENTION_FUNCTIONS[name] = attention_patch(func)
+
+    # Also patch eager_attention_forward which is used directly by eager attention
+    # and NOT registered in ALL_ATTENTION_FUNCTIONS
+    try:
+        import transformers.models.llama.modeling_llama as llama_module
+        if hasattr(llama_module, 'eager_attention_forward'):
+            original_eager = llama_module.eager_attention_forward
+            llama_module.eager_attention_forward = attention_patch(original_eager)
+    except ImportError:
+        pass
+
+    # Patch other model architectures that use eager attention directly
+    try:
+        import transformers.models.mistral.modeling_mistral as mistral_module
+        if hasattr(mistral_module, 'eager_attention_forward'):
+            original_eager = mistral_module.eager_attention_forward
+            mistral_module.eager_attention_forward = attention_patch(original_eager)
+    except ImportError:
+        pass
+
+    try:
+        import transformers.models.qwen2.modeling_qwen2 as qwen2_module
+        if hasattr(qwen2_module, 'eager_attention_forward'):
+            original_eager = qwen2_module.eager_attention_forward
+            qwen2_module.eager_attention_forward = attention_patch(original_eager)
+    except ImportError:
+        pass

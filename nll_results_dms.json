@@ -1,0 +1,11 @@
+{
+  "model": "nvidia/Qwen3-8B-DMS-8x",
+  "data_path": "/home/manufay/govreport.val.jsonl",
+  "max_samples": 10,
+  "max_length": 4096,
+  "perplexity": 8.622992950373114,
+  "avg_nll": 2.1544322344322344,
+  "total_nll": 88224.0,
+  "total_tokens": 40950,
+  "num_samples": 10
+}
